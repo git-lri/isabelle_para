@@ -7,6 +7,7 @@ section \<open>Old Datatype package: constructing datatypes from Cartesian Produ
 
 theory Old_Datatype
 imports Main
+keywords "old_datatype" :: thy_decl
 begin
 
 

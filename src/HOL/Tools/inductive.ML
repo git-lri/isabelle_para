@@ -58,6 +58,9 @@ sig
     Specification.multi_specs_cmd ->
     (Facts.ref * Token.src list) list ->
     local_theory -> result * local_theory
+  val add_inductive_global: flags ->
+    ((binding * typ) * mixfix) list -> (string * typ) list -> (Attrib.binding * term) list ->
+    thm list -> theory -> result * theory
   val arities_of: thm -> (string * int) list
   val params_of: thm -> term list
   val partition_rules: thm -> thm list -> (string * thm list) list
@@ -1221,6 +1224,16 @@ fun gen_add_inductive_cmd mk_def verbose coind cnames_syn pnames_syn intro_srcs 
 
 val add_inductive = gen_add_inductive add_ind_def;
 val add_inductive_cmd = gen_add_inductive_cmd add_ind_def;
+
+fun add_inductive_global flags cnames_syn pnames pre_intros monos thy =
+  let
+    val name = Sign.full_name thy (fst (fst (hd cnames_syn)));
+    val ctxt' = thy
+      |> Named_Target.theory_init
+      |> add_inductive flags cnames_syn pnames pre_intros monos |> snd
+      |> Local_Theory.exit;
+    val info = #2 (the_inductive_global ctxt' name);
+  in (info, Proof_Context.theory_of ctxt') end;
 
 
 (* read off arities of inductive predicates from raw induction rule *)

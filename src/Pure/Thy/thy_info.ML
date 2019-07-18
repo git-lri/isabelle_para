@@ -280,23 +280,65 @@ val schedule_futures = Thread_Attributes.uninterruptible (fn _ => fn tasks =>
 
 (* eval theory *)
 
+datatype span_raw =
+    Span_cmd of Command_Span.span
+  | Span_tr of Toplevel.transition
+
 fun excursion keywords master_dir last_timing init elements =
   let
-    fun prepare_span st span =
-      Command_Span.content span
-      |> Command.read keywords (Command.read_thy st) master_dir init ([], ~1)
-      |> (fn tr => Toplevel.timing (last_timing tr) tr);
+    fun prepare_span st = fn
+      Span_cmd span =>
+        Command_Span.content span
+        |> Command.read keywords (Command.read_thy st) (Toplevel.proof_of' st) master_dir init ([], ~1)
+        |> map (fn tr => Toplevel.timing (last_timing tr) tr)
+    | Span_tr tr => [tr];
 
-    fun element_result span_elem (st, _) =
+    fun element_result elem (st, _) =
       let
-        val elem = Thy_Element.map_element (prepare_span st) span_elem;
         val (results, st') = Toplevel.element_result keywords elem st;
         val pos' = Toplevel.pos_of (Thy_Element.last_element elem);
       in (results, (st', pos')) end;
 
+    val meta_cmd = fn [_] => false | _ => true
     val (results, (end_state, end_pos)) =
-      fold_map element_result elements (Toplevel.init_toplevel (), Position.none);
-
+      let fun aux _ ([], acc) = ([], acc)
+        | aux prev_xs ((x :: xs), acc) =
+          let
+            val x0 = Thy_Element.map_element (prepare_span (#1 acc)) x
+          in
+            if Thy_Element.exists_element meta_cmd x0 then
+              let val (l_reparse, prev_xs) =
+                if case x0 of Thy_Element.Element (a0, _) => meta_cmd a0 then
+                   prev_xs |>
+                        (Scan.permissive (Scan.one (fn (Thy_Element.Element (_, NONE), _) => true | _ => false) >> (fn l => [l]))
+                         || Scan.succeed [])
+                else ([], prev_xs)
+              in
+                aux
+                  prev_xs
+                  (apfst
+                    (fn l =>
+                       Thy_Element.parse_elements keywords
+                          (fn x => Span_cmd (Command_Span.Span (x, [])))
+                          (fn Span_cmd (Command_Span.Span (x, _)) => x
+                            | Span_tr tr => Command_Span.Command_Span (Toplevel.name_of tr, Toplevel.pos_of tr))
+                          (List.concat (List.concat [ l,
+                                                      map (map Span_tr) (Thy_Element.flat_element x0),
+                                                      map Thy_Element.flat_element xs])))
+                    (case map (apfst Thy_Element.flat_element) (rev l_reparse) of
+                       [] => ([], acc)
+                     | (x, acc) :: xs => (x :: map #1 xs, acc)))
+              end
+            else
+              let
+                val x0 = Thy_Element.map_element hd x0
+                val (x', acc') = element_result x0 acc;
+                val (xs', acc'') = aux ((Thy_Element.map_element Span_tr x0, acc) :: prev_xs) (xs, acc');
+              in (x' :: xs', acc'') end
+          end
+      in
+      aux [] (elements, (Toplevel.init_toplevel (), Position.none))
+      end;
     val thy = Toplevel.end_theory end_pos end_state;
   in (results, thy) end;
 
@@ -309,7 +351,11 @@ fun eval_thy (context: context) update_time master_dir header text_pos text pare
         (Keyword.add_keywords (#keywords header) Keyword.empty_keywords);
 
     val spans = Outer_Syntax.parse_spans (Token.explode keywords text_pos text);
-    val elements = Thy_Element.parse_elements keywords spans;
+    val elements = map (Thy_Element.map_element Span_cmd)
+                       (Thy_Element.parse_elements keywords
+                                                   (fn x => Command_Span.Span (x, []))
+                                                   (fn Command_Span.Span (x, _) => x)
+                                                   spans)
 
     fun init () =
       Resources.begin_theory master_dir header parents
@@ -322,8 +368,14 @@ fun eval_thy (context: context) update_time master_dir header text_pos text pare
 
     fun present () =
       let
-        val segments = (spans ~~ maps Toplevel.join_results results)
-          |> map (fn (span, (tr, st')) => {span = span, command = tr, state = st'});
+        fun split_trans [] acc = rev acc
+          | split_trans (x :: xs) acc =
+              case chop_prefix let val pos_of = Toplevel.pos_of o fst
+                                   val p = pos_of x in fn t => p = pos_of t end
+                               xs of
+                   (xs1, xs2) => split_trans xs2 ((x :: xs1) :: acc);
+        val segments = (spans ~~ split_trans (maps Toplevel.join_results results) [])
+          |> map (fn (span, results) => {span = span, command = map #1 results, state = #2 (hd results)});
         val context: presentation_context =
           {options = options, file_pos = text_pos, adjust_pos = I, segments = segments};
       in apply_presentation context thy end;
@@ -451,9 +503,9 @@ fun use_thy name =
 
 fun script_thy pos txt thy =
   let
-    val trs = Outer_Syntax.parse_text thy (K thy) pos txt;
-    val end_pos = if null trs then pos else Toplevel.pos_of (List.last trs);
-    val end_state = fold (Toplevel.command_exception true) trs (Toplevel.init_toplevel ());
+    val trs = Outer_Syntax.parse_text thy NONE (K thy) pos txt;
+    val end_pos = if null trs then pos else Toplevel.pos_of (List.last (List.last trs));
+    val end_state = fold (fold (Toplevel.command_exception true)) trs (Toplevel.init_toplevel ());
   in Toplevel.end_theory end_pos end_state end;
 
 

@@ -20,6 +20,7 @@ sig
   val generic_theory_of: state -> generic_theory
   val theory_of: state -> theory
   val proof_of: state -> Proof.state
+  val proof_of': state -> Proof.state option
   val proof_position_of: state -> int
   val is_end_theory: state -> bool
   val end_theory: Position.T -> state -> theory
@@ -29,7 +30,10 @@ sig
   val pretty_state: state -> Pretty.T list
   val string_of_state: state -> string
   val pretty_abstract: state -> Pretty.T
+  datatype state_read = Load_backup | Load_previous
+  datatype state_write = Store_backup | Store_default
   type transition
+  type transitions = transition list
   val empty: transition
   val name_of: transition -> string
   val pos_of: transition -> Position.T
@@ -37,18 +41,19 @@ sig
   val type_error: transition -> string
   val name: string -> transition -> transition
   val position: Position.T -> transition -> transition
+  val read_write: state_read * state_write -> transition -> transition
   val markers: Input.source list -> transition -> transition
   val timing: Time.time -> transition -> transition
   val init_theory: (unit -> theory) -> transition -> transition
   val is_init: transition -> bool
-  val modify_init: (unit -> theory) -> transition -> transition
+  val modify_init: (unit -> theory) -> transitions -> transitions
   val exit: transition -> transition
   val keep: (state -> unit) -> transition -> transition
   val keep': (bool -> state -> unit) -> transition -> transition
   val keep_proof: (state -> unit) -> transition -> transition
-  val ignored: Position.T -> transition
-  val is_ignored: transition -> bool
-  val malformed: Position.T -> string -> transition
+  val ignored: Position.T -> transitions
+  val is_ignored: transitions -> bool
+  val malformed: Position.T -> string -> transitions
   val generic_theory: (generic_theory -> generic_theory) -> transition -> transition
   val theory': (bool -> theory -> theory) -> transition -> transition
   val theory: (theory -> theory) -> transition -> transition
@@ -77,7 +82,7 @@ sig
   val skip_proof: (unit -> unit) -> transition -> transition
   val skip_proof_open: transition -> transition
   val skip_proof_close: transition -> transition
-  val exec_id: Document_ID.exec -> transition -> transition
+  val exec_id: Document_ID.exec -> transitions -> transitions
   val setmp_thread_position: transition -> ('a -> 'b) -> 'a -> 'b
   val add_hook: (transition -> state -> state -> unit) -> unit
   val transition: bool -> transition -> state -> state * (exn * string) option
@@ -138,14 +143,18 @@ fun node_presentation node =
 
 
 datatype state =
-  State of node_presentation * theory option;
-    (*current node with presentation context, previous theory*)
+  State of node_presentation * theory option * 
+           (node_presentation * theory option);
+    (*current node with presentation context, previous theory, backup*)
 
-fun node_of (State ((node, _), _)) = node;
-fun previous_theory_of (State (_, prev_thy)) = prev_thy;
+fun State' (n1, n2) = State (n1, n2, (n1, n2))
 
-fun init_toplevel () = State (node_presentation Toplevel, NONE);
-fun theory_toplevel thy = State (node_presentation (Theory (Context.Theory thy)), NONE);
+fun node_of (State ((node, _), _, _)) = node;
+fun previous_theory_of (State (_, prev_thy, _)) = prev_thy;
+fun backup_of (State (_, _, backup)) = backup;
+
+fun init_toplevel () = State' (node_presentation Toplevel, NONE);
+fun theory_toplevel thy = State' (node_presentation (Theory (Context.Theory thy)), NONE);
 
 
 fun level state =
@@ -187,16 +196,17 @@ val context_of = proper_node_case Context.proof_of Proof.context_of;
 val generic_theory_of = proper_node_case I (Context.Proof o Proof.context_of);
 val theory_of = proper_node_case Context.theory_of Proof.theory_of;
 val proof_of = proper_node_case (fn _ => error "No proof state") I;
+fun proof_of' st = if is_proof st then SOME (proof_of st) else NONE;
 
 fun proof_position_of state =
   (case proper_node_of state of
     Proof (prf, _) => Proof_Node.position prf
   | _ => ~1);
 
-fun is_end_theory (State ((Toplevel, _), SOME _)) = true
+fun is_end_theory (State ((Toplevel, _), SOME _, _)) = true
   | is_end_theory _ = false;
 
-fun end_theory _ (State ((Toplevel, _), SOME thy)) = thy
+fun end_theory _ (State ((Toplevel, _), SOME thy, _)) = thy
   | end_theory pos _ = error ("Malformed theory" ^ Position.here pos);
 
 
@@ -208,15 +218,15 @@ structure Presentation_State = Proof_Data
   fun init _ = NONE;
 );
 
-fun presentation_context0 (State ((_, pr_ctxt), _)) = pr_ctxt;
+fun presentation_context0 (State ((_, pr_ctxt), _, _)) = pr_ctxt;
 
-fun presentation_context (state as State (current, _)) =
+fun presentation_context (state as State (current, _, backup)) =
   presentation_context0 state
-  |> Presentation_State.put (SOME (State (current, NONE)));
+  |> Presentation_State.put (SOME (State (current, NONE, backup)));
 
 fun presentation_state ctxt =
   (case Presentation_State.get ctxt of
-    NONE => State (node_presentation (Theory (Context.Proof ctxt)), NONE)
+    NONE => State' (node_presentation (Theory (Context.Proof ctxt)), NONE)
   | SOME state => state);
 
 
@@ -268,11 +278,11 @@ local
 
 exception FAILURE of state * exn;
 
-fun apply f g node =
+fun apply backup f g node =
   let
     val node_pr = node_presentation node;
     val context = cases_proper_node I (Context.Proof o Proof.context_of) node;
-    fun state_error e node_pr' = (State (node_pr', get_theory node), e);
+    fun state_error e node_pr' = (State (node_pr', get_theory node, backup), e);
 
     val (result, err) =
       node
@@ -289,19 +299,19 @@ fun apply_tr int trans state =
   (case (trans, node_of state) of
     (Init f, Toplevel) =>
       Runtime.controlled_execution NONE (fn () =>
-        State (node_presentation (Theory (Context.Theory (f ()))), NONE)) ()
+        State (node_presentation (Theory (Context.Theory (f ()))), NONE, backup_of state)) ()
   | (Exit, node as Theory (Context.Theory thy)) =>
       let
-        val State ((node', pr_ctxt), _) =
-          node |> apply
+        val State ((node', pr_ctxt), _, backup) =
+          node |> apply (backup_of state)
             (fn _ => node_presentation (Theory (Context.Theory (Theory.end_theory thy))))
             (K ());
-      in State ((Toplevel, pr_ctxt), get_theory node') end
+      in State ((Toplevel, pr_ctxt), get_theory node', backup) end
   | (Keep f, node) =>
       Runtime.controlled_execution (try generic_theory_of state)
-        (fn () => (f int state; State (node_presentation node, previous_theory_of state))) ()
+        (fn () => (f int state; State (node_presentation node, previous_theory_of state, backup_of state))) ()
   | (Transaction _, Toplevel) => raise UNDEF
-  | (Transaction (f, g), node) => apply (fn x => f int x) g node
+  | (Transaction (f, g), node) => apply (backup_of state) (fn x => f int x) g node
   | _ => raise UNDEF);
 
 fun apply_union _ [] state = raise FAILURE (state, UNDEF)
@@ -312,11 +322,11 @@ fun apply_union _ [] state = raise FAILURE (state, UNDEF)
           | exn as FAILURE _ => raise exn
           | exn => raise FAILURE (state, exn);
 
-fun apply_markers name markers (state as State ((node, pr_ctxt), prev_thy)) =
+fun apply_markers name markers (state as State ((node, pr_ctxt), prev_thy, backup)) =
   let
     val state' =
       Runtime.controlled_execution (try generic_theory_of state)
-        (fn () => State ((node, fold (Document_Marker.evaluate name) markers pr_ctxt), prev_thy)) ();
+        (fn () => State ((node, fold (Document_Marker.evaluate name) markers pr_ctxt), prev_thy, backup)) ();
   in (state', NONE) end
   handle exn => (state, SOME exn);
 
@@ -331,20 +341,26 @@ end;
 
 (* datatype transition *)
 
+datatype state_read = Load_backup | Load_previous
+datatype state_write = Store_backup | Store_default
+
 datatype transition = Transition of
- {name: string,               (*command name*)
-  pos: Position.T,            (*source position*)
-  markers: Input.source list, (*semantic document markers*)
-  timing: Time.time,          (*prescient timing information*)
-  trans: trans list};         (*primitive transitions (union)*)
+ {name: string,                           (*command name*)
+  pos: Position.T,                        (*source position*)
+  markers: Input.source list,             (*semantic document markers*)
+  timing: Time.time,                      (*prescient timing information*)
+  trans: trans list,                      (*primitive transitions (union)*)
+  read_write: state_read * state_write};  (*state update status*)
 
-fun make_transition (name, pos, markers, timing, trans) =
-  Transition {name = name, pos = pos, markers = markers, timing = timing, trans = trans};
+type transitions = transition list
 
-fun map_transition f (Transition {name, pos, markers, timing, trans}) =
-  make_transition (f (name, pos, markers, timing, trans));
+fun make_transition (name, pos, markers, timing, trans, read_write) =
+  Transition {name = name, pos = pos, markers = markers, timing = timing, trans = trans, read_write = read_write};
 
-val empty = make_transition ("", Position.none, [], Time.zeroTime, []);
+fun map_transition f (Transition {name, pos, markers, timing, trans, read_write}) =
+  make_transition (f (name, pos, markers, timing, trans, read_write));
+
+val empty = make_transition ("", Position.none, [], Time.zeroTime, [], (Load_previous, Store_default));
 
 
 (* diagnostics *)
@@ -363,23 +379,26 @@ fun type_error tr = command_msg "Bad context for " tr;
 
 (* modify transitions *)
 
-fun name name = map_transition (fn (_, pos, markers, timing, trans) =>
-  (name, pos, markers, timing, trans));
+fun name name = map_transition (fn (_, pos, markers, timing, trans, read_write) =>
+  (name, pos, markers, timing, trans, read_write));
 
-fun position pos = map_transition (fn (name, _, markers, timing, trans) =>
-  (name, pos, markers, timing, trans));
+fun position pos = map_transition (fn (name, _, markers, timing, trans, read_write) =>
+  (name, pos, markers, timing, trans, read_write));
 
-fun markers markers = map_transition (fn (name, pos, _, timing, trans) =>
-  (name, pos, markers, timing, trans));
+fun markers markers = map_transition (fn (name, pos, _, timing, trans, read_write) =>
+  (name, pos, markers, timing, trans, read_write));
 
-fun timing timing = map_transition (fn (name, pos, markers, _, trans) =>
-  (name, pos, markers, timing, trans));
+fun timing timing = map_transition (fn (name, pos, markers, _, trans, read_write) =>
+  (name, pos, markers, timing, trans, read_write));
 
-fun add_trans tr = map_transition (fn (name, pos, markers, timing, trans) =>
-  (name, pos, markers, timing, tr :: trans));
+fun add_trans tr = map_transition (fn (name, pos, markers, timing, trans, read_write) =>
+  (name, pos, markers, timing, tr :: trans, read_write));
 
-val reset_trans = map_transition (fn (name, pos, markers, timing, _) =>
-  (name, pos, markers, timing, []));
+val reset_trans = map_transition (fn (name, pos, markers, timing, _, read_write) =>
+  (name, pos, markers, timing, [], read_write));
+
+fun read_write read_write = map_transition (fn (name, pos, markers, timing, trans, _) =>
+  (name, pos, markers, timing, trans, read_write));
 
 
 (* basic transitions *)
@@ -389,7 +408,8 @@ fun init_theory f = add_trans (Init f);
 fun is_init (Transition {trans = [Init _], ...}) = true
   | is_init _ = false;
 
-fun modify_init f tr = if is_init tr then init_theory f (reset_trans tr) else tr;
+fun modify_init' f tr = if is_init tr then init_theory f (reset_trans tr) else tr;
+val modify_init = map o modify_init'
 
 val exit = add_trans Exit;
 val keep' = add_trans o Keep;
@@ -406,11 +426,14 @@ fun keep_proof f =
     else if is_skipped_proof st then ()
     else warning "No proof state");
 
-fun ignored pos = empty |> name "<ignored>" |> position pos |> keep (fn _ => ());
-fun is_ignored tr = name_of tr = "<ignored>";
+fun ignored' pos = empty |> name "<ignored>" |> position pos |> keep (fn _ => ());
+fun ignored pos = [ignored' pos];
+fun is_ignored' tr = name_of tr = "<ignored>";
+val is_ignored = fn [] => false | (tr :: _) => is_ignored' tr;
 
-fun malformed pos msg =
+fun malformed' pos msg =
   empty |> name "<malformed>" |> position pos |> keep (fn _ => error msg);
+fun malformed pos msg = [malformed' pos msg];
 
 
 (* theory transitions *)
@@ -592,8 +615,9 @@ val skip_proof_close = transaction0 (fn _ =>
 
 (* runtime position *)
 
-fun exec_id id (tr as Transition {pos, ...}) =
+fun exec_id' id (tr as Transition {pos, ...}) =
   position (Position.put_id (Document_ID.print id) pos) tr;
+val exec_id = map o exec_id';
 
 fun setmp_thread_position (Transition {pos, ...}) f x =
   Position.setmp_thread_data pos f x;
@@ -621,13 +645,23 @@ fun app int (tr as Transition {name, markers, trans, ...}) =
     (Timing.protocol (name_of tr) (pos_of tr) (apply_trans int name markers trans)
       ##> Option.map (fn UNDEF => ERROR (type_error tr) | exn => exn));
 
+fun state_load (Transition {read_write = (read, _), ...}) (st as State (_, _, (nd1, nd0))) =
+  case read of Load_backup => State' (nd1, nd0)
+             | Load_previous => st
+
+fun state_store (Transition {read_write = (_, write), ...}) (st as State (nd1, nd0, _)) =
+  case write of Store_backup => State' (nd1, nd0)
+              | Store_default => st
+
 in
 
 fun transition int tr st =
   let
+    val st = state_load tr st
     val (st', opt_err) =
       Context.setmp_generic_context (try (Context.Proof o presentation_context0) st)
-        (fn () => app int tr st) ();
+        (fn () => app int tr st) ()
+      |> apfst (state_store tr);
     val opt_err' = opt_err |> Option.map
       (fn Runtime.EXCURSION_FAIL exn_info => exn_info
         | exn => (Runtime.exn_context (try context_of st) exn, at_command tr));
@@ -763,10 +797,10 @@ fun element_result keywords (Thy_Element.Element (tr, NONE)) st = atom_result ke
                   {name = "Toplevel.future_proof", pos = pos_of head_tr, pri = ~1}
                   (fn () =>
                     let
-                      val State ((Proof (prf, (_, orig_gthy)), _), prev_thy) = st';
+                      val State ((Proof (prf, (_, orig_gthy)), _), prev_thy, backup) = st';
                       val node' = Proof (Proof_Node.apply (K state) prf, (finish, orig_gthy));
                       val (results, result_state) =
-                        State (node_presentation node', prev_thy)
+                        State (node_presentation node', prev_thy, backup)
                         |> fold_map (element_result keywords) body_elems ||> command end_tr1;
                     in (Result_List results, presentation_context0 result_state) end))
               #> (fn (res, state') => state' |> put_result (Result_Future res));
